@@ -69,6 +69,7 @@
 #else
 #include "optimizer/optimizer.h"
 #endif
+#include "parser/parse_relation.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -145,7 +146,7 @@ static void deparseReturningList(StringInfo buf, PlannerInfo *root,
 					 List **retrieved_attrs,
 					 TdsFdwOptionSet* option_set);
 static void deparseColumnRef(StringInfo buf, int varno, int varattno,
-				 PlannerInfo *root);
+				 PlannerInfo *root, bool target_list);
 static void deparseRelation(StringInfo buf, Relation rel);
 static void deparseExpr(Expr *expr, deparse_expr_cxt *context);
 static void deparseVar(Var *node, deparse_expr_cxt *context);
@@ -823,7 +824,7 @@ deparseTargetList(StringInfo buf,
 				appendStringInfoString(buf, ", ");
 			first = false;
 
-			deparseColumnRef(buf, rtindex, i, root);
+			deparseColumnRef(buf, rtindex, i, root, true);
 
 			*retrieved_attrs = lappend_int(*retrieved_attrs, i);
 		}
@@ -942,7 +943,7 @@ deparseInsertSql(StringInfo buf, PlannerInfo *root,
 				appendStringInfoString(buf, ", ");
 			first = false;
 
-			deparseColumnRef(buf, rtindex, attnum, root);
+			deparseColumnRef(buf, rtindex, attnum, root, false);
 		}
 
 		appendStringInfoString(buf, ") VALUES (");
@@ -1004,7 +1005,7 @@ deparseUpdateSql(StringInfo buf, PlannerInfo *root,
 			appendStringInfoString(buf, ", ");
 		first = false;
 
-		deparseColumnRef(buf, rtindex, attnum, root);
+		deparseColumnRef(buf, rtindex, attnum, root, false);
 		appendStringInfo(buf, " = $%d", pindex);
 		pindex++;
 	}
@@ -1166,12 +1167,13 @@ deparseAnalyzeSql(StringInfo buf, Relation rel, List **retrieved_attrs)
  * If it has a column_name FDW option, use that instead of attribute name.
  */
 static void
-deparseColumnRef(StringInfo buf, int varno, int varattno, PlannerInfo *root)
+deparseColumnRef(StringInfo buf, int varno, int varattno, PlannerInfo *root, bool target_list)
 {
 	RangeTblEntry *rte;
 	char	   *colname = NULL;
 	List	   *options;
 	ListCell   *lc;
+	Oid       datatype;
 
 	/* varno must not be any of OUTER_VAR, INNER_VAR and INDEX_VAR. */
 	Assert(!IS_SPECIAL_VARNO(varno));
@@ -1200,9 +1202,59 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, PlannerInfo *root)
 	 * option, use attribute name.
 	 */
 	if (colname == NULL)
+	{
 		colname = get_relid_attribute_name(rte->relid, varattno);
+	}
 
-	appendStringInfoString(buf, tds_quote_identifier(colname));
+	datatype = get_atttype(rte->relid, varattno);
+
+	if (target_list)
+	{
+		if (datatype == 1114 || datatype == 1184) /* timestamp or timestamptz*/
+		{
+			appendStringInfoString(buf, "CONVERT(varchar, ");
+			appendStringInfoString(buf, tds_quote_identifier(colname));
+			appendStringInfoString(buf, ", 25) AS \"");
+			appendStringInfoString(buf, colname);
+			appendStringInfoString(buf, "\"");
+		}
+		else if (datatype == 1082) /* date */
+		{
+			appendStringInfoString(buf, "CONVERT(varchar, ");
+			appendStringInfoString(buf, tds_quote_identifier(colname));
+			appendStringInfoString(buf, ", 23) AS \"");
+			appendStringInfoString(buf, colname);
+			appendStringInfoString(buf, "\"");
+		}
+		else if (datatype == 1083) /* time */
+		{
+			appendStringInfoString(buf, "CONVERT(varchar, ");
+			appendStringInfoString(buf, tds_quote_identifier(colname));
+			appendStringInfoString(buf, ", 24) AS \"");
+			appendStringInfoString(buf, colname);
+			appendStringInfoString(buf, "\"");
+		}
+		else if (datatype == 1043 || datatype == 25) /* varchar and text */
+		{
+			appendStringInfoString(buf, "cast(");
+			appendStringInfoString(buf, tds_quote_identifier(colname));
+			appendStringInfoString(buf, " as nvarchar) AS \"");
+			appendStringInfoString(buf, colname);
+			appendStringInfoString(buf, "\"");
+		}
+		else if (datatype == 18) /* char */
+		{
+			appendStringInfoString(buf, "cast(");
+			appendStringInfoString(buf, tds_quote_identifier(colname));
+			appendStringInfoString(buf, " as nchar) AS \"");
+			appendStringInfoString(buf, colname);
+			appendStringInfoString(buf, "\"");
+		}
+		else
+			appendStringInfoString(buf, tds_quote_identifier(colname));
+	}
+	else	
+		appendStringInfoString(buf, tds_quote_identifier(colname));
 }
 
 /*
@@ -1378,7 +1430,7 @@ deparseVar(Var *node, deparse_expr_cxt *context)
 		node->varlevelsup == 0)
 	{
 		/* Var belongs to foreign table */
-		deparseColumnRef(buf, node->varno, node->varattno, context->root);
+		deparseColumnRef(buf, node->varno, node->varattno, context->root, false);
 	}
 	else
 	{
